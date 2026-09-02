@@ -105,6 +105,69 @@ def get_store_info(access_token):
     return result.get("data", {})
 
 
+def salla_get_json(access_token, url):
+    req = urllib.request.Request(
+        url,
+        headers=salla_headers(access_token),
+        method="GET"
+    )
+
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.loads(
+            response.read().decode("utf-8")
+        )
+
+
+def get_salla_collection(access_token, endpoint, per_page=100):
+    all_items = []
+    page = 1
+
+    while True:
+        separator = "&" if "?" in endpoint else "?"
+        url = (
+            f"https://api.salla.dev/admin/v2/{endpoint}"
+            f"{separator}page={page}&per_page={per_page}"
+        )
+
+        result = salla_get_json(access_token, url)
+
+        items = result.get("data", [])
+        if not isinstance(items, list):
+            items = []
+
+        all_items.extend(items)
+
+        pagination = result.get("pagination") or {}
+        total_pages = pagination.get("totalPages")
+
+        if not total_pages or page >= int(total_pages):
+            break
+
+        page += 1
+
+        # Safety limit so a bad pagination response cannot loop forever.
+        if page > 100:
+            break
+
+    return all_items
+
+
+def get_products(access_token):
+    # "format=light" keeps the response smaller while still giving
+    # the agent the main product information needed for analysis.
+    return get_salla_collection(
+        access_token,
+        "products?format=light"
+    )
+
+
+def get_categories(access_token):
+    return get_salla_collection(
+        access_token,
+        "categories"
+    )
+
+
 def extract_openai_text(result):
     if result.get("output_text"):
         return result["output_text"]
@@ -321,6 +384,116 @@ def agent_store_info():
 
 
 # =========================================================
+# AI AGENT - Products
+# =========================================================
+
+@app.route("/agent/products", methods=["GET"])
+def agent_products():
+    row = get_connected_store()
+
+    if not row:
+        return jsonify({
+            "success": False,
+            "message": "No authorized Salla store"
+        }), 404
+
+    merchant_id, access_token = row
+
+    try:
+        products = get_products(access_token)
+
+        return jsonify({
+            "success": True,
+            "merchant_id": merchant_id,
+            "count": len(products),
+            "products": products
+        }), 200
+
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8")
+        except Exception:
+            pass
+
+        print(
+            f"Salla products HTTP error: "
+            f"{e.code} {error_body}"
+        )
+
+        return jsonify({
+            "success": False,
+            "message": "Failed to read Salla products"
+        }), 500
+
+    except Exception as e:
+        print(
+            f"Salla products error: "
+            f"{type(e).__name__}: {e}"
+        )
+
+        return jsonify({
+            "success": False,
+            "message": "Failed to read Salla products"
+        }), 500
+
+
+# =========================================================
+# AI AGENT - Categories
+# =========================================================
+
+@app.route("/agent/categories", methods=["GET"])
+def agent_categories():
+    row = get_connected_store()
+
+    if not row:
+        return jsonify({
+            "success": False,
+            "message": "No authorized Salla store"
+        }), 404
+
+    merchant_id, access_token = row
+
+    try:
+        categories = get_categories(access_token)
+
+        return jsonify({
+            "success": True,
+            "merchant_id": merchant_id,
+            "count": len(categories),
+            "categories": categories
+        }), 200
+
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8")
+        except Exception:
+            pass
+
+        print(
+            f"Salla categories HTTP error: "
+            f"{e.code} {error_body}"
+        )
+
+        return jsonify({
+            "success": False,
+            "message": "Failed to read Salla categories"
+        }), 500
+
+    except Exception as e:
+        print(
+            f"Salla categories error: "
+            f"{type(e).__name__}: {e}"
+        )
+
+        return jsonify({
+            "success": False,
+            "message": "Failed to read Salla categories"
+        }), 500
+
+
+# =========================================================
 # AI AGENT - Chat
 # =========================================================
 
@@ -366,6 +539,46 @@ def agent_chat():
             "status": store.get("status"),
             "plan": store.get("plan"),
         }
+
+        # Read-only snapshot for the AI's current planning context.
+        # We intentionally keep only the fields useful for planning.
+        products = get_products(access_token)
+        categories = get_categories(access_token)
+
+        store_context["products_count"] = len(products)
+        store_context["categories_count"] = len(categories)
+
+        store_context["products"] = [
+            {
+                "id": product.get("id"),
+                "name": product.get("name"),
+                "type": product.get("type"),
+                "price": product.get("price"),
+                "status": product.get("status"),
+                "is_available": product.get("is_available"),
+                "quantity": product.get("quantity"),
+                "description": product.get("description"),
+                "categories": [
+                    {
+                        "id": category.get("id"),
+                        "name": category.get("name")
+                    }
+                    for category in (product.get("categories") or [])
+                ]
+            }
+            for product in products[:100]
+        ]
+
+        store_context["categories"] = [
+            {
+                "id": category.get("id"),
+                "name": category.get("name"),
+                "parent_id": category.get("parent_id"),
+                "status": category.get("status"),
+                "sort_order": category.get("sort_order")
+            }
+            for category in categories[:100]
+        ]
 
         system_instructions = """
 أنت Fares AI، وكيل ذكي متخصص في إدارة وتطوير متاجر سلة.
