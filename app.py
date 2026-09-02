@@ -163,6 +163,15 @@ def get_products(access_token):
     )
 
 
+def get_product_details(access_token, product_id):
+    if not product_id:
+        raise ValueError("product_id is required")
+    return salla_get_json(
+        access_token,
+        f"https://api.salla.dev/admin/v2/products/{product_id}"
+    )
+
+
 def get_categories(access_token):
     return get_salla_collection(
         access_token,
@@ -467,20 +476,6 @@ def get_salla_collection(access_token, endpoint, per_page=100):
     return all_items
 
 
-def get_products(access_token):
-    return get_salla_collection(
-        access_token,
-        "products?format=light"
-    )
-
-
-def get_categories(access_token):
-    return get_salla_collection(
-        access_token,
-        "categories"
-    )
-
-
 def create_category(access_token, arguments):
     allowed = {
         key: value
@@ -516,29 +511,79 @@ def update_category(access_token, arguments):
     )
 
 
-def attach_product_image(access_token, product_id, image_url, alt_text=""):
-    """Attach a public image URL to a Salla product."""
-    if not image_url:
-        raise ValueError("image_url is required")
+def _multipart_field(boundary, name, value):
+    return (
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"{name}\"\r\n\r\n"
+        f"{value}\r\n"
+    )
 
-    boundary = "----FaresAIAgentBoundary7MA4YWxkTrZu0gW"
-    fields = {
-        "original": str(image_url),
-        "main": "true",
-        "default": "1",
-        "sort": "1",
-        "alt": alt_text or "product image"
-    }
 
-    parts = []
+def _multipart_file(boundary, name, filename, content_type, data):
+    header = (
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n"
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode("utf-8")
+    return header + data + b"\r\n"
+
+
+def _download_image_bytes(image_url, timeout=12):
+    req = urllib.request.Request(
+        image_url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/152.0.0.0 Safari/537.36"
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+        }
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        content_type = (response.headers.get("Content-Type") or "").split(";")[0].lower()
+        data = response.read(8 * 1024 * 1024)
+        final_url = response.geturl()
+
+    if not data:
+        raise ValueError("image download returned no bytes")
+
+    # Some CDNs omit Content-Type. Infer a safe extension from the URL.
+    lowered = final_url.lower().split("?", 1)[0]
+    if content_type == "image/jpeg" or lowered.endswith((".jpg", ".jpeg")):
+        content_type = "image/jpeg"
+        ext = ".jpg"
+    elif content_type == "image/png" or lowered.endswith(".png"):
+        content_type = "image/png"
+        ext = ".png"
+    elif content_type == "image/webp" or lowered.endswith(".webp"):
+        content_type = "image/webp"
+        ext = ".webp"
+    elif content_type == "image/avif" or lowered.endswith(".avif"):
+        # Salla can be stricter with AVIF uploads; convert is not available here,
+        # so keep URL mode as the primary path and only use this as a last resort.
+        ext = ".avif"
+    else:
+        raise ValueError(f"downloaded resource is not an image: {content_type or 'unknown'}")
+
+    return data, content_type, f"product-image{ext}", final_url
+
+
+def _post_product_image_multipart(access_token, product_id, fields, file_part=None, timeout=20):
+    boundary = "----FaresAIAgentBoundaryV8X9pQ"
+    body_parts = []
     for key, value in fields.items():
-        parts.append(
-            f"--{boundary}\r\n"
-            f"Content-Disposition: form-data; name=\"{key}\"\r\n\r\n"
-            f"{value}\r\n"
+        if value is not None:
+            body_parts.append(_multipart_field(boundary, key, value).encode("utf-8"))
+
+    if file_part:
+        filename, content_type, data = file_part
+        body_parts.append(
+            _multipart_file(boundary, "photo", filename, content_type, data)
         )
-    parts.append(f"--{boundary}--\r\n")
-    body = "".join(parts).encode("utf-8")
+
+    body_parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(body_parts)
 
     req = urllib.request.Request(
         f"https://api.salla.dev/admin/v2/products/{product_id}/images",
@@ -552,10 +597,68 @@ def attach_product_image(access_token, product_id, image_url, alt_text=""):
         method="POST"
     )
 
-    with urllib.request.urlopen(req, timeout=30) as response:
-        raw = response.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        error_body = ""
+        try:
+            error_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Salla image upload failed HTTP {exc.code}: {error_body[:1200]}"
+        ) from exc
 
-    return json.loads(raw) if raw else {}
+
+def attach_product_image(access_token, product_id, image_url, alt_text=""):
+    """Attach a public image URL, with a file-upload fallback for Salla 422 responses."""
+    if not image_url:
+        raise ValueError("image_url is required")
+
+    fields = {
+        "original": str(image_url),
+        "main": "true",
+        "default": "1",
+        "sort": "1",
+        "alt": alt_text or "product image"
+    }
+
+    # First: use Salla's documented URL-link mode.
+    try:
+        return _post_product_image_multipart(
+            access_token, product_id, fields, file_part=None, timeout=20
+        )
+    except RuntimeError as first_error:
+        print("IMAGE URL ATTACH FAILED:", str(first_error))
+
+        # Second: download the real image ourselves and upload it as `photo`.
+        # This avoids cases where Salla cannot fetch an external CDN URL.
+        try:
+            data, content_type, filename, final_url = _download_image_bytes(
+                image_url, timeout=12
+            )
+            file_result = _post_product_image_multipart(
+                access_token,
+                product_id,
+                fields={
+                    "original": final_url,
+                    "main": "true",
+                    "default": "1",
+                    "sort": "1",
+                    "alt": alt_text or "product image"
+                },
+                file_part=(filename, content_type, data),
+                timeout=20
+            )
+            file_result["_upload_mode"] = "photo_file_fallback"
+            return file_result
+        except Exception as second_error:
+            print("IMAGE FILE FALLBACK FAILED:", repr(second_error))
+            raise RuntimeError(
+                f"{first_error}; file fallback failed: {second_error}"
+            ) from second_error
 
 
 def _collect_urls(value):
@@ -1045,8 +1148,8 @@ def create_product(access_token, arguments):
             "image": image_result,
             "image_source_page": (search_info or {}).get("source_page")
         }
-    except urllib.error.HTTPError as first_error:
-        print(f"First image attach failed: HTTP {first_error.code}")
+    except Exception as first_error:
+        print("First image attach failed:", repr(first_error))
 
         # Try one alternate image only. Never invent a URL.
         retry = search_product_image_with_openai(arguments.get("name", ""))
@@ -1450,6 +1553,10 @@ def execute_agent_tool(name, arguments, access_token):
     if name == "get_store_info":
         return get_store_info(access_token)
 
+    if name == "get_product_details":
+        product_id = arguments.get("product_id")
+        return get_product_details(access_token, product_id)
+
     if name == "get_products":
         return simplify_products(
             get_products(access_token)
@@ -1714,7 +1821,7 @@ def agent_chat():
 12. لا تستخدم رابط صفحة ويب كرابط صورة ولا تخمّن أي رابط. استخدم image_url الذي أعادته الأداة فقط.
 13. إذا فشلت find_product_image، لا تدّعي أن الصورة أضيفت.
 14. إذا نجحت find_product_image، مرّر image_url وimage_alt إلى create_product. أداة create_product هي التي تحاول إرفاق الصورة فعليًا في سلة، وقد تعيد المحاولة بصورة بديلة إذا رفض المصدر الأول.
-15. بعد إنشاء المنتج، استخدم get_products للتحقق من وجود المنتج والصورة.
+15. بعد إنشاء المنتج، استخدم get_product_details باستخدام product_id الذي أعادته create_product للتحقق من وجود المنتج والصورة. لا تستخدم get_products للتحقق مباشرة بعد الإنشاء.
 16. تحدث بالعربية السعودية وبأسلوب واضح ومباشر.
 17. يمكنك تنفيذ عدة عمليات متتالية إذا كان طلب المستخدم واضحًا.
 18. قبل إنشاء قسم جديد، اقرأ الأقسام الحالية لتجنب التكرار.
