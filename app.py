@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Temporary storage for testing.
 tokens = {}
 
 
@@ -90,7 +89,7 @@ def test_salla():
             "store_name": store.get("name")
         }), 200
 
-        except Exception as e:
+    except Exception as e:
         print(f"Salla API error: {type(e).__name__}")
 
         if hasattr(e, "code"):
