@@ -99,7 +99,7 @@ def get_store_info(access_token):
         headers=salla_headers(access_token)
     )
 
-    with urllib.request.urlopen(req, timeout=15) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         result = json.loads(
             response.read().decode("utf-8")
         )
@@ -552,7 +552,7 @@ def attach_product_image(access_token, product_id, image_url, alt_text=""):
         method="POST"
     )
 
-    with urllib.request.urlopen(req, timeout=60) as response:
+    with urllib.request.urlopen(req, timeout=30) as response:
         raw = response.read().decode("utf-8")
 
     return json.loads(raw) if raw else {}
@@ -576,7 +576,7 @@ def _collect_urls(value):
     return urls
 
 
-def _extract_page_image_url(page_url):
+def _extract_page_image_url(page_url, timeout=15):
     """Fetch a public page and extract og:image/twitter:image/JSON-LD image."""
     from html import unescape
 
@@ -593,7 +593,7 @@ def _extract_page_image_url(page_url):
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             content_type = response.headers.get("Content-Type", "")
             final_url = response.geturl()
             raw = response.read(600000).decode("utf-8", errors="ignore")
@@ -772,7 +772,7 @@ def _looks_like_image_url(image_url):
     return any(marker in lowered for marker in image_markers)
 
 
-def _validate_image_url(image_url):
+def _validate_image_url(image_url, timeout=10):
     """Best-effort validation. Never reject a plausible CDN image only because HEAD is blocked."""
     if not image_url or not image_url.startswith(("http://", "https://")):
         return False
@@ -786,7 +786,7 @@ def _validate_image_url(image_url):
             },
             method="HEAD"
         )
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             content_type = (response.headers.get("Content-Type") or "").lower()
             if content_type.startswith("image/"):
                 return True
@@ -803,7 +803,7 @@ def _validate_image_url(image_url):
             },
             method="GET"
         )
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             content_type = (response.headers.get("Content-Type") or "").lower()
             response.read(2048)
             if content_type.startswith("image/"):
@@ -848,101 +848,102 @@ def _image_search_queries(product_name):
 
 
 def search_product_image_with_openai(product_name):
-    """Find a real product image URL using web search, then let Salla validate it."""
+    """Find a real public product image URL with one bounded web-search pass."""
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not configured")
+        return {
+            "success": False,
+            "image_url": None,
+            "alt": product_name,
+            "message": "OPENAI_API_KEY is not configured"
+        }
 
-    all_source_urls = []
-    all_candidates = []
-
-    for query in _image_search_queries(product_name):
-        prompt = f"""
+    prompt = f"""
 ابحث في الإنترنت عن المنتج التالي:
 {product_name}
 
-أريد صورة حقيقية للمنتج من الإنترنت، وليست صورة مولدة بالذكاء الاصطناعي.
-نفّذ البحث عن المنتج ثم استخرج إن أمكن رابط الصورة المباشر نفسه (JPG أو PNG أو WEBP)، وليس رابط صفحة المنتج.
-إذا لم يظهر رابط الصورة المباشر، اذكر أفضل صفحة منتج موثوقة تحتوي على صورة المنتج حتى يستطيع الخادم استخراج og:image منها.
+المطلوب صورة حقيقية للمنتج وليست صورة مولدة بالذكاء الاصطناعي.
+ابحث عن صفحة المنتج الرسمية أو متجر موثوق، واستخرج:
+1) رابط الصورة المباشر نفسه إذا كان ظاهرًا (JPG/PNG/WEBP)، أو
+2) رابط صفحة المنتج التي تحتوي على صورة المنتج إذا تعذر استخراج الرابط المباشر.
 
-لا تستخدم أي رابط من متجر سلة الخاص بي.
-لا تخترع أي رابط.
-لا تعطِ رابطًا لصفحة سلة.
+أعد أفضل النتائج فقط، ولا تخترع أي رابط، ولا تستخدم أي رابط من سلة.
+إذا كان المنتج من علامة معروفة فالأولوية للموقع الرسمي للعلامة التجارية، ثم متجر موثوق.
 """
 
-        payload = {
-            "model": "gpt-5.6-luna",
-            "tools": [
-                {
-                    "type": "web_search",
-                    "search_context_size": "high"
-                }
-            ],
-            "input": prompt
+    payload = {
+        "model": "gpt-5.6-luna",
+        "tools": [{
+            "type": "web_search",
+            "search_context_size": "high"
+        }],
+        "input": prompt
+    }
+
+    try:
+        result = openai_response(payload, timeout=45)
+    except Exception as exc:
+        print("IMAGE SEARCH ERROR:", repr(exc))
+        return {
+            "success": False,
+            "image_url": None,
+            "alt": product_name,
+            "message": "تعذر إكمال البحث عن صورة المنتج في الوقت المحدد."
         }
 
-        try:
-            result = openai_response(payload)
-        except Exception as exc:
-            print("IMAGE SEARCH ERROR:", exc)
+    source_urls = []
+    candidates = []
+
+    for url in _extract_web_search_source_urls(result):
+        if not url or _is_blocked_source(url):
             continue
+        if url not in source_urls:
+            source_urls.append(url)
+        if _looks_like_image_url(url):
+            candidates.append((url, url))
 
-        urls = _extract_web_search_source_urls(result)
-        for url in urls:
-            if url not in all_source_urls and not _is_blocked_source(url):
-                all_source_urls.append(url)
+    text = result.get("output_text") or ""
+    for candidate in re.findall(r'https?://[^\s<>"\']+', text):
+        candidate = candidate.rstrip(".,;:)]}")
+        if _is_blocked_source(candidate):
+            continue
+        if _looks_like_image_url(candidate):
+            candidates.append((candidate, candidate))
 
-        # First try URLs exposed directly by the search response.
-        for candidate in urls:
-            if _is_blocked_source(candidate):
-                continue
-            if _looks_like_image_url(candidate):
-                all_candidates.append((candidate, candidate))
+    # Open only a small number of result pages. This keeps the request safely
+    # below the Render/Gunicorn request timeout while still extracting og:image.
+    for page_url in source_urls[:5]:
+        if _is_blocked_source(page_url):
+            continue
+        image_url = _extract_page_image_url(page_url, timeout=6)
+        if image_url and not _is_blocked_source(image_url):
+            candidates.append((image_url, page_url))
 
-        # Then open each search result and extract og:image / JSON-LD.
-        for page_url in urls[:15]:
-            if _is_blocked_source(page_url):
-                continue
-            image_url = _extract_page_image_url(page_url)
-            if image_url and not _is_blocked_source(image_url):
-                all_candidates.append((image_url, page_url))
-
-        # The model may put a direct image URL in output_text even when the
-        # Responses API does not expose it as a source object.
-        text = result.get("output_text") or ""
-        for candidate in re.findall(r'https?://[^\s<>"\']+', text):
-            candidate = candidate.rstrip(".,;:)]}")
-            if _is_blocked_source(candidate):
-                continue
-            if _looks_like_image_url(candidate):
-                all_candidates.append((candidate, candidate))
-
-        # De-duplicate while preserving search order.
-        seen = set()
-        for image_url, source_page in all_candidates:
-            if image_url in seen:
-                continue
-            seen.add(image_url)
-
-            # Strong validation when possible; otherwise accept a plausible
-            # image URL and let Salla perform the definitive fetch.
-            if _validate_image_url(image_url) or _looks_like_image_url(image_url):
-                return {
-                    "success": True,
-                    "image_url": image_url,
-                    "alt": product_name,
-                    "source_page": source_page,
-                    "message": "تم العثور على رابط صورة حقيقي محتمل، وسيتم التحقق منه عند إرفاقه في سلة."
-                }
+    seen = set()
+    for image_url, source_page in candidates:
+        if image_url in seen:
+            continue
+        seen.add(image_url)
+        if _is_blocked_source(image_url):
+            continue
+        if _validate_image_url(image_url, timeout=5) or _looks_like_image_url(image_url):
+            return {
+                "success": True,
+                "image_url": image_url,
+                "alt": product_name,
+                "source_page": source_page,
+                "message": "تم العثور على صورة حقيقية للمنتج وسيتم إرفاقها بالمنتج في سلة."
+            }
 
     return {
         "success": False,
         "image_url": None,
         "alt": product_name,
-        "sources_checked": all_source_urls[:20],
-        "message": "لم أجد رابط صورة مناسبًا يمكن استخدامه. لا تستخدم أي رابط مخمن."
+        "sources_checked": source_urls[:10],
+        "message": "لم أجد رابط صورة مباشرًا صالحًا يمكن استخدامه للمنتج."
     }
 
 def create_product(access_token, arguments):
+    """Create a product, then find and attach a real public image when possible."""
     image_url = arguments.get("image_url")
     image_alt = arguments.get("image_alt") or arguments.get("name", "product image")
 
@@ -964,41 +965,89 @@ def create_product(access_token, arguments):
         body
     )
 
-    if image_url:
-        product_id = (created.get("data") or {}).get("id")
-        if not product_id:
-            raise RuntimeError("Salla created the product but did not return its ID")
+    product_id = (created.get("data") or {}).get("id")
+    if not product_id:
+        raise RuntimeError("Salla created the product but did not return its ID")
 
-        try:
-            image_result = attach_product_image(
-                access_token,
-                product_id,
-                image_url,
-                image_alt
-            )
-        except urllib.error.HTTPError as first_error:
-            # A CDN may reject server-side fetching even though the image is
-            # valid in a browser. Search once more for another public image.
-            print(f"First image attach failed: HTTP {first_error.code}")
-            retry = search_product_image_with_openai(arguments.get("name", ""))
-            retry_url = retry.get("image_url") if retry.get("success") else None
-            if not retry_url or retry_url == image_url:
-                raise
-            image_result = attach_product_image(
-                access_token,
-                product_id,
-                retry_url,
-                image_alt
-            )
-            image_result["retry_source_page"] = retry.get("source_page")
+    # If the model did not provide an image URL, search here as a safety net.
+    # This guarantees image handling is part of product creation instead of
+    # relying only on the model to call find_product_image first.
+    search_info = None
+    if not image_url:
+        search_info = search_product_image_with_openai(arguments.get("name", ""))
+        if search_info.get("success"):
+            image_url = search_info.get("image_url")
+            image_alt = search_info.get("alt") or image_alt
 
+    if not image_url:
         return {
             "product": created,
-            "image": image_result
+            "image": {
+                "success": False,
+                "image_url": None,
+                "message": (search_info or {}).get(
+                    "message",
+                    "تم إنشاء المنتج، لكن لم يتم العثور على صورة صالحة حتى الآن."
+                )
+            }
         }
 
-    return created
+    try:
+        image_result = attach_product_image(
+            access_token,
+            product_id,
+            image_url,
+            image_alt
+        )
+        return {
+            "product": created,
+            "image": image_result,
+            "image_source_page": (search_info or {}).get("source_page")
+        }
+    except urllib.error.HTTPError as first_error:
+        print(f"First image attach failed: HTTP {first_error.code}")
 
+        # Try one alternate image only. Never invent a URL.
+        retry = search_product_image_with_openai(arguments.get("name", ""))
+        retry_url = retry.get("image_url") if retry.get("success") else None
+
+        if retry_url and retry_url != image_url:
+            try:
+                image_result = attach_product_image(
+                    access_token,
+                    product_id,
+                    retry_url,
+                    image_alt
+                )
+                return {
+                    "product": created,
+                    "image": image_result,
+                    "image_source_page": retry.get("source_page"),
+                    "image_retry": True
+                }
+            except Exception as retry_error:
+                print("Second image attach failed:", repr(retry_error))
+
+        # Product creation succeeded even if Salla rejected both image URLs.
+        # Return a structured result instead of crashing /agent/chat with 500.
+        return {
+            "product": created,
+            "image": {
+                "success": False,
+                "image_url": image_url,
+                "message": "تم إنشاء المنتج، لكن سلة رفضت إرفاق الصورة. المنتج لم يُحذف."
+            }
+        }
+    except Exception as exc:
+        print("IMAGE ATTACH ERROR:", repr(exc))
+        return {
+            "product": created,
+            "image": {
+                "success": False,
+                "image_url": image_url,
+                "message": "تم إنشاء المنتج، لكن حدث خطأ أثناء إرفاق الصورة."
+            }
+        }
 
 def update_product(access_token, arguments):
     product_id = arguments.get("product_id")
@@ -1404,7 +1453,7 @@ def execute_agent_tool(name, arguments, access_token):
     )
 
 
-def openai_response(payload):
+def openai_response(payload, timeout=120):
     req = urllib.request.Request(
         "https://api.openai.com/v1/responses",
         data=json.dumps(
@@ -1421,7 +1470,7 @@ def openai_response(payload):
 
     with urllib.request.urlopen(
         req,
-        timeout=120
+        timeout=timeout
     ) as response:
         return json.loads(
             response.read().decode("utf-8")
