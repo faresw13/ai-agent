@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import os
 import json
 import urllib.request
+import urllib.error
 import psycopg
 
 app = Flask(__name__)
@@ -9,11 +10,39 @@ app = Flask(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
+BACKEND_ORIGINS = "*"
+
+
+# =========================================================
+# CORS
+# =========================================================
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = BACKEND_ORIGINS
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Authorization"
+    )
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET, POST, OPTIONS"
+    )
+    return response
+
+
+@app.route("/<path:path>", methods=["OPTIONS"])
+@app.route("/", methods=["OPTIONS"])
+def options(path=None):
+    return "", 204
+
+
 # =========================================================
 # Database
 # =========================================================
 
 def get_db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured")
+
     return psycopg.connect(DATABASE_URL)
 
 
@@ -58,6 +87,7 @@ def get_connected_store():
                 FROM salla_tokens
                 LIMIT 1
             """)
+
             return cur.fetchone()
 
 
@@ -76,17 +106,16 @@ def get_store_info(access_token):
 
 
 def extract_openai_text(result):
-    # Some Responses API responses include output_text
     if result.get("output_text"):
         return result["output_text"]
 
-    # Fallback: extract text from output blocks
     texts = []
 
     for item in result.get("output", []):
         for content in item.get("content", []):
             if content.get("type") == "output_text":
                 text = content.get("text")
+
                 if text:
                     texts.append(text)
 
@@ -342,6 +371,7 @@ def agent_chat():
 أنت Fares AI، وكيل ذكي متخصص في إدارة وتطوير متاجر سلة.
 
 مهمتك الأساسية مساعدة صاحب المتجر في:
+
 - تصميم المتجر
 - ترتيب الصفحة الرئيسية
 - إنشاء الأقسام
@@ -356,9 +386,11 @@ def agent_chat():
 أنت تعمل داخل لوحة تحكم سلة.
 
 في الوقت الحالي أنت في مرحلة المحادثة والتخطيط.
+
 لا تدّعي أنك نفذت أي تعديل إذا لم يتم تنفيذه فعليًا.
 
 إذا طلب المستخدم تنفيذ شيء:
+
 1. افهم المطلوب.
 2. حلل حالة المتجر المتاحة لك.
 3. اقترح خطة واضحة.
