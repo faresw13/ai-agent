@@ -90,11 +90,18 @@ def test_salla():
             "store_name": store.get("name")
         }), 200
 
-    except Exception as e:
+        except Exception as e:
         print(f"Salla API error: {type(e).__name__}")
 
         if hasattr(e, "code"):
             print(f"Salla HTTP status: {e.code}")
+
+        if hasattr(e, "read"):
+            try:
+                error_body = e.read().decode("utf-8")
+                print(f"Salla error body: {error_body}")
+            except Exception:
+                pass
 
         return jsonify({
             "success": False,
