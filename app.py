@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# Temporary storage for testing
 tokens = {}
 
 
@@ -73,13 +74,21 @@ def test_salla():
         "https://api.salla.dev/admin/v2/store/info",
         headers={
             "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/152.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7"
         }
     )
 
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
-            result = json.loads(response.read().decode("utf-8"))
+            result = json.loads(
+                response.read().decode("utf-8")
+            )
 
         store = result.get("data", {})
 
