@@ -613,52 +613,33 @@ def _post_product_image_multipart(access_token, product_id, fields, file_part=No
 
 
 def attach_product_image(access_token, product_id, image_url, alt_text=""):
-    """Attach a public image URL, with a file-upload fallback for Salla 422 responses."""
+    """Download a real public image and upload it to Salla as multipart photo."""
     if not image_url:
         raise ValueError("image_url is required")
 
-    fields = {
-        "original": str(image_url),
-        "main": "true",
-        "default": "1",
-        "sort": "1",
-        "alt": alt_text or "product image"
-    }
+    data, content_type, filename, final_url = _download_image_bytes(
+        image_url, timeout=12
+    )
 
-    # First: use Salla's documented URL-link mode.
-    try:
-        return _post_product_image_multipart(
-            access_token, product_id, fields, file_part=None, timeout=20
-        )
-    except RuntimeError as first_error:
-        print("IMAGE URL ATTACH FAILED:", str(first_error))
+    # Salla's current validation accepts image extensions in `original`.
+    # Use the actual image filename instead of the external URL.
+    result = _post_product_image_multipart(
+        access_token,
+        product_id,
+        fields={
+            "original": filename,
+            "main": "true",
+            "default": "1",
+            "sort": "1",
+            "alt": alt_text or "product image"
+        },
+        file_part=(filename, content_type, data),
+        timeout=20
+    )
 
-        # Second: download the real image ourselves and upload it as `photo`.
-        # This avoids cases where Salla cannot fetch an external CDN URL.
-        try:
-            data, content_type, filename, final_url = _download_image_bytes(
-                image_url, timeout=12
-            )
-            file_result = _post_product_image_multipart(
-                access_token,
-                product_id,
-                fields={
-                    "original": final_url,
-                    "main": "true",
-                    "default": "1",
-                    "sort": "1",
-                    "alt": alt_text or "product image"
-                },
-                file_part=(filename, content_type, data),
-                timeout=20
-            )
-            file_result["_upload_mode"] = "photo_file_fallback"
-            return file_result
-        except Exception as second_error:
-            print("IMAGE FILE FALLBACK FAILED:", repr(second_error))
-            raise RuntimeError(
-                f"{first_error}; file fallback failed: {second_error}"
-            ) from second_error
+    result["_upload_mode"] = "photo_file"
+    result["_source_url"] = final_url
+    return result
 
 
 def _collect_urls(value):
@@ -1087,9 +1068,17 @@ def search_product_image_with_openai(product_name):
     }
 
 def create_product(access_token, arguments):
-    """Create a product, then find and attach a real public image when possible."""
+    """Create a product with its image in the create request, then verify/fallback."""
     image_url = arguments.get("image_url")
     image_alt = arguments.get("image_alt") or arguments.get("name", "product image")
+    search_info = None
+
+    # Safety net: if the model forgot to call find_product_image, search here.
+    if not image_url:
+        search_info = search_product_image_with_openai(arguments.get("name", ""))
+        if search_info.get("success"):
+            image_url = search_info.get("image_url")
+            image_alt = search_info.get("alt") or image_alt
 
     body = {
         key: value
@@ -1102,6 +1091,18 @@ def create_product(access_token, arguments):
     body.setdefault("require_shipping", True)
     body.setdefault("status", "sale")
 
+    # Salla's Create Product API explicitly supports images in the request body.
+    # Use the discovered public URL directly; this avoids the problematic
+    # post-create `original=<external URL>` validation path.
+    if image_url:
+        body["images"] = [{
+            "original": image_url,
+            "thumbnail": image_url,
+            "alt": image_alt,
+            "default": True,
+            "sort": 1
+        }]
+
     created = salla_request(
         access_token,
         "POST",
@@ -1109,89 +1110,83 @@ def create_product(access_token, arguments):
         body
     )
 
-    product_id = (created.get("data") or {}).get("id")
+    product_data = created.get("data") or {}
+    product_id = product_data.get("id")
     if not product_id:
         raise RuntimeError("Salla created the product but did not return its ID")
 
-    # If the model did not provide an image URL, search here as a safety net.
-    # This guarantees image handling is part of product creation instead of
-    # relying only on the model to call find_product_image first.
-    search_info = None
-    if not image_url:
-        search_info = search_product_image_with_openai(arguments.get("name", ""))
-        if search_info.get("success"):
-            image_url = search_info.get("image_url")
-            image_alt = search_info.get("alt") or image_alt
+    created_images = product_data.get("images") or []
+    created_main_image = product_data.get("main_image")
 
-    if not image_url:
+    # If Create Product accepted the image, we're done with the upload step.
+    if image_url and (created_images or created_main_image):
         return {
             "product": created,
             "image": {
-                "success": False,
-                "image_url": None,
-                "message": (search_info or {}).get(
-                    "message",
-                    "تم إنشاء المنتج، لكن لم يتم العثور على صورة صالحة حتى الآن."
-                )
-            }
-        }
-
-    try:
-        image_result = attach_product_image(
-            access_token,
-            product_id,
-            image_url,
-            image_alt
-        )
-        return {
-            "product": created,
-            "image": image_result,
+                "success": True,
+                "image_url": created_main_image or image_url,
+                "message": "تم إنشاء المنتج وإضافة الصورة ضمن طلب الإنشاء.",
+                "upload_mode": "create_product_images"
+            },
             "image_source_page": (search_info or {}).get("source_page")
         }
-    except Exception as first_error:
-        print("First image attach failed:", repr(first_error))
 
-        # Try one alternate image only. Never invent a URL.
-        retry = search_product_image_with_openai(arguments.get("name", ""))
-        retry_url = retry.get("image_url") if retry.get("success") else None
+    # Fallback: download the image and upload it as `photo`.
+    if image_url:
+        try:
+            image_result = attach_product_image(
+                access_token,
+                product_id,
+                image_url,
+                image_alt
+            )
+            return {
+                "product": created,
+                "image": image_result,
+                "image_source_page": (search_info or {}).get("source_page")
+            }
+        except Exception as first_error:
+            print("CREATE IMAGE FALLBACK FAILED:", repr(first_error))
 
-        if retry_url and retry_url != image_url:
-            try:
-                image_result = attach_product_image(
-                    access_token,
-                    product_id,
-                    retry_url,
-                    image_alt
-                )
-                return {
-                    "product": created,
-                    "image": image_result,
-                    "image_source_page": retry.get("source_page"),
-                    "image_retry": True
+            # One alternate source only; never invent a URL.
+            retry = search_product_image_with_openai(arguments.get("name", ""))
+            retry_url = retry.get("image_url") if retry.get("success") else None
+
+            if retry_url and retry_url != image_url:
+                try:
+                    image_result = attach_product_image(
+                        access_token,
+                        product_id,
+                        retry_url,
+                        image_alt
+                    )
+                    return {
+                        "product": created,
+                        "image": image_result,
+                        "image_source_page": retry.get("source_page"),
+                        "image_retry": True
+                    }
+                except Exception as retry_error:
+                    print("SECOND CREATE IMAGE FALLBACK FAILED:", repr(retry_error))
+
+            return {
+                "product": created,
+                "image": {
+                    "success": False,
+                    "image_url": image_url,
+                    "message": "تم إنشاء المنتج، لكن سلة لم تقبل الصورة. لم يتم حذف المنتج."
                 }
-            except Exception as retry_error:
-                print("Second image attach failed:", repr(retry_error))
+            }
 
-        # Product creation succeeded even if Salla rejected both image URLs.
-        # Return a structured result instead of crashing /agent/chat with 500.
-        return {
-            "product": created,
-            "image": {
-                "success": False,
-                "image_url": image_url,
-                "message": "تم إنشاء المنتج، لكن سلة رفضت إرفاق الصورة. المنتج لم يُحذف."
-            }
+    return {
+        "product": created,
+        "image": {
+            "success": False,
+            "image_url": None,
+            "message": "تم إنشاء المنتج، لكن لم تتوفر صورة صالحة لإضافتها."
         }
-    except Exception as exc:
-        print("IMAGE ATTACH ERROR:", repr(exc))
-        return {
-            "product": created,
-            "image": {
-                "success": False,
-                "image_url": image_url,
-                "message": "تم إنشاء المنتج، لكن حدث خطأ أثناء إرفاق الصورة."
-            }
-        }
+    }
+
 
 def update_product(access_token, arguments):
     product_id = arguments.get("product_id")
@@ -1284,7 +1279,7 @@ def get_agent_tools():
             "name": "get_products",
             "description": (
                 "اقرأ منتجات المتجر الحالية من سلة. "
-                "استخدمها قبل أي قرار يتعلق بالمنتجات."
+                "استخدمها عند الحاجة لقراءة المنتجات الحالية قبل اختيار منتج للتعديل أو قبل عمليات جماعية. لا تستخدمها للتحقق من منتج تم إنشاؤه للتو؛ استخدم get_product_details."
             ),
             "parameters": {
                 "type": "object",
@@ -1828,7 +1823,7 @@ def agent_chat():
 19. قبل تعديل منتج، اقرأ المنتجات الحالية لتحديد المنتج الصحيح.
 20. لا تعتبر مجرد اقتراح خطة تنفيذًا؛ استخدم الأدوات فعليًا عندما يطلب المستخدم التنفيذ.
 
-عند طلب إنشاء منتج مع صورة من الإنترنت، اتبع هذا التسلسل: قراءة الأقسام عند الحاجة، البحث عن الصورة الحقيقية، إنشاء المنتج بالوصف والسعر والكمية والصورة، ثم قراءة المنتجات للتحقق من النتيجة.
+عند طلب إنشاء منتج مع صورة من الإنترنت، اتبع هذا التسلسل: قراءة الأقسام عند الحاجة، البحث عن الصورة الحقيقية، إنشاء المنتج بالوصف والسعر والكمية والصورة، ثم التحقق من المنتج مباشرة باستخدام get_product_details بمعرّف المنتج الذي أعادته create_product. لا تستخدم get_products للتحقق بعد الإنشاء.
 
 هدفك أن تساعد صاحب المتجر على تجهيز متجره فعليًا، وليس فقط إعطائه
 اقتراحات نظرية.
