@@ -1,9 +1,30 @@
 from flask import Flask, request, jsonify
+import os
+import json
+import urllib.request
+import psycopg
 
 app = Flask(__name__)
 
-# Temporary storage for testing
-tokens = {}
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+
+def get_db():
+    return psycopg.connect(DATABASE_URL)
+
+
+def init_db():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS salla_tokens (
+                    merchant_id TEXT PRIMARY KEY,
+                    access_token TEXT NOT NULL,
+                    refresh_token TEXT,
+                    expires BIGINT
+                )
+            """)
+        conn.commit()
 
 
 @app.route("/", methods=["GET"])
@@ -33,17 +54,37 @@ def webhook():
         expires = payload.get("expires")
 
         if access_token and merchant:
-            tokens[str(merchant)] = {
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "expires": expires,
-            }
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO salla_tokens
+                        (merchant_id, access_token, refresh_token, expires)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (merchant_id)
+                        DO UPDATE SET
+                            access_token = EXCLUDED.access_token,
+                            refresh_token = EXCLUDED.refresh_token,
+                            expires = EXCLUDED.expires
+                    """, (
+                        str(merchant),
+                        access_token,
+                        refresh_token,
+                        expires
+                    ))
+                conn.commit()
 
             print(f"Salla authorization saved for merchant={merchant}")
 
     elif event == "app.uninstalled":
         if merchant:
-            tokens.pop(str(merchant), None)
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM salla_tokens WHERE merchant_id = %s",
+                        (str(merchant),)
+                    )
+                conn.commit()
+
             print(f"Salla authorization removed for merchant={merchant}")
 
     return jsonify({"success": True}), 200
@@ -51,24 +92,40 @@ def webhook():
 
 @app.route("/status", methods=["GET"])
 def status():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT merchant_id
+                FROM salla_tokens
+            """)
+
+            merchants = [row[0] for row in cur.fetchall()]
+
     return jsonify({
-        "connected_merchants": list(tokens.keys())
+        "connected_merchants": merchants
     }), 200
 
 
 @app.route("/test-salla", methods=["GET"])
 def test_salla():
-    import urllib.request
-    import json
 
-    if not tokens:
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT merchant_id, access_token
+                FROM salla_tokens
+                LIMIT 1
+            """)
+
+            row = cur.fetchone()
+
+    if not row:
         return jsonify({
             "success": False,
             "message": "No authorized Salla store"
         }), 404
 
-    merchant = next(iter(tokens))
-    access_token = tokens[merchant]["access_token"]
+    merchant, access_token = row
 
     req = urllib.request.Request(
         "https://api.salla.dev/admin/v2/store/info",
@@ -80,7 +137,9 @@ def test_salla():
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/152.0.0.0 Safari/537.36"
             ),
-            "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7"
+            "Accept-Language": (
+                "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7"
+            )
         }
     )
 
@@ -117,5 +176,11 @@ def test_salla():
         }), 500
 
 
+init_db()
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(
+        host="0.0.0.0",
+        port=10000
+    )
