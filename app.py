@@ -798,89 +798,94 @@ def _validate_image_url(image_url):
 
 
 def search_product_image_with_openai(product_name):
-    """Search the web for a real product page and return only a validated image URL."""
+    """Search broadly for a real product page and return a validated image URL.
+
+    Important: do NOT restrict the web search to the manufacturer's domain.
+    Some manufacturer pages (for example, Apple) block server-side fetching,
+    while retailer/review/product pages may expose a usable og:image or JSON-LD image.
+    """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not configured")
 
-    allowed_domains = _allowed_domains_for_product(product_name)
-    domain_hint = ""
-    if allowed_domains:
-        domain_hint = (
-            "Prefer these official domains when available: "
-            + ", ".join(allowed_domains)
-            + "."
-        )
+    queries = [
+        f'"{product_name}" official product image',
+        f'"{product_name}" product photo image review',
+    ]
 
-    prompt = f"""
-ابحث في الإنترنت عن صفحة منتج حقيقية وموثوقة تحتوي على صورة واضحة للمنتج التالي:
+    all_source_urls = []
+
+    for query in queries:
+        prompt = f"""
+ابحث في الإنترنت عن صفحة حقيقية وموثوقة للمنتج التالي:
 {product_name}
 
-{domain_hint}
+الهدف هو العثور على صفحة يمكن الوصول إليها من الخادم وتحتوي على صورة واضحة للمنتج.
+فضّل صفحة الشركة المصنعة، لكن إذا كانت محجوبة أو لا يمكن الوصول إلى صورتها، اختر
+مصدرًا موثوقًا آخر مثل متجر معروف أو موقع مراجعات تقني معروف.
 
-اختر أفضل صفحة منتج من نتائج البحث.
-في نهاية ردك اكتب سطرًا واحدًا فقط بهذا الشكل:
-PAGE_URL: https://...
+لا تستخدم أي صفحة من متجر سلة الخاص بي.
+لا تخترع أي رابط.
 
-يجب أن يكون الرابط الذي بعد PAGE_URL رابط صفحة حقيقية ظهرت في نتائج البحث، وليس رابط متجر سلة، وليس رابطًا مخمنًا.
-فضّل الشركة المصنعة أو صفحة منتج موثوقة.
-لا تنشئ أي رابط من عندك.
+في نهاية الرد اذكر أفضل صفحة ظهرت في نتائج البحث.
 """
 
-    tool = {
-        "type": "web_search",
-        "search_context_size": "high"
-    }
-    if allowed_domains:
-        tool["filters"] = {"allowed_domains": allowed_domains}
+        payload = {
+            "model": "gpt-5.6-luna",
+            "tools": [
+                {
+                    "type": "web_search",
+                    "search_context_size": "high"
+                }
+            ],
+            "input": prompt
+        }
 
-    payload = {
-        "model": "gpt-5.6-luna",
-        "tools": [tool],
-        "input": prompt
-    }
+        try:
+            result = openai_response(payload)
+        except Exception as exc:
+            print("IMAGE SEARCH ERROR:", exc)
+            continue
 
-    result = openai_response(payload)
-    source_urls = _extract_web_search_source_urls(result)
+        for url in _extract_web_search_source_urls(result):
+            if url not in all_source_urls and not _is_blocked_source(url):
+                all_source_urls.append(url)
 
-    # Never accept our own store or Salla URLs as an external source.
-    source_urls = [url for url in source_urls if not _is_blocked_source(url)]
+        # Try every URL exposed by the Responses API, including URL citations.
+        for page_url in all_source_urls[-20:]:
+            if _is_blocked_source(page_url):
+                continue
 
-    checked = []
-    for page_url in source_urls[:20]:
-        # If search returned a direct image URL, accept it only after validation.
-        if not _is_blocked_source(page_url) and _validate_image_url(page_url):
+            # Sometimes a search source itself is a direct image URL.
+            if _validate_image_url(page_url):
+                return {
+                    "success": True,
+                    "image_url": page_url,
+                    "alt": product_name,
+                    "source_page": page_url
+                }
+
+            image_url = _extract_page_image_url(page_url)
+            if not image_url:
+                continue
+            if _is_blocked_source(image_url):
+                continue
+            if not _validate_image_url(image_url):
+                continue
+
             return {
                 "success": True,
-                "image_url": page_url,
+                "image_url": image_url,
                 "alt": product_name,
                 "source_page": page_url
             }
-
-        image_url = _extract_page_image_url(page_url)
-        if not image_url:
-            continue
-        if _is_blocked_source(image_url):
-            continue
-        if not _validate_image_url(image_url):
-            continue
-
-        return {
-            "success": True,
-            "image_url": image_url,
-            "alt": product_name,
-            "source_page": page_url
-        }
-
-        checked.append(page_url)
 
     return {
         "success": False,
         "image_url": None,
         "alt": product_name,
-        "sources_checked": source_urls[:10],
+        "sources_checked": all_source_urls[:20],
         "message": "لم أجد رابط صورة عام موثوق يمكن التحقق منه. لا تستخدم أي رابط بديل أو مخمن."
     }
-
 
 def create_product(access_token, arguments):
     image_url = arguments.get("image_url")
