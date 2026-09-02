@@ -99,7 +99,7 @@ def get_store_info(access_token):
         headers=salla_headers(access_token)
     )
 
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    with urllib.request.urlopen(req, timeout=30) as response:
         result = json.loads(
             response.read().decode("utf-8")
         )
@@ -954,6 +954,28 @@ def _direct_product_page_candidates(product_name):
             "https://www.apple.com/sa-ar/iphone/",
             "https://www.apple.com/sa/iphone/",
         ]
+    elif "galaxy s25 ultra" in lowered or "s25 ultra" in lowered:
+        candidates += [
+            "https://www.samsung.com/sa/smartphones/galaxy-s25-ultra/",
+            "https://www.samsung.com/sa/smartphones/galaxy-s25-ultra/specs/",
+        ]
+
+    return candidates
+
+
+def _direct_product_image_candidates(product_name):
+    """Known public manufacturer image URLs for common products.
+    These are deterministic fallbacks so image search does not depend on an
+    OpenAI web-search round trip timing out on Render.
+    """
+    name=(product_name or "").lower().strip()
+    candidates=[]
+
+    if "galaxy s25 ultra" in name or "s25 ultra" in name:
+        candidates += [
+            "https://images.samsung.com/sa_en/smartphones/galaxy-s25-ultra/buy/kv_global_PC_v2.jpg?imbypass=true",
+            "https://images.samsung.com/sa_en/smartphones/galaxy-s25-ultra/buy/color_jetBlack.png",
+        ]
 
     return candidates
 
@@ -977,7 +999,18 @@ def search_product_image_with_openai(product_name):
             "message": "اسم المنتج غير موجود."
         }
 
-    # Fast path: official pages for products with predictable URLs.
+    # Fastest path: known manufacturer image URLs.
+    for image_url in _direct_product_image_candidates(product_name):
+        if image_url and not _is_blocked_source(image_url) and _looks_like_image_url(image_url):
+            return {
+                "success": True,
+                "image_url": image_url,
+                "alt": product_name,
+                "source_page": None,
+                "message": "تم العثور على صورة حقيقية مباشرة من خادم الشركة المصنعة."
+            }
+
+    # Fast path: official product pages for products with predictable URLs.
     for page_url in _direct_product_page_candidates(product_name)[:2]:
         if _is_blocked_source(page_url):
             continue
@@ -1021,7 +1054,7 @@ def search_product_image_with_openai(product_name):
     try:
         # Keep this bounded. The image tool must never hold the whole chat
         # request open long enough for a Render worker to be killed.
-        result = openai_response(payload, timeout=18)
+        result = openai_response(payload, timeout=8)
     except Exception as exc:
         print("IMAGE SEARCH ERROR:", repr(exc))
         return {
