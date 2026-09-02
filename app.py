@@ -1,10 +1,8 @@
 from flask import Flask, request, jsonify
-import os
 
 app = Flask(__name__)
 
 # Temporary storage for testing.
-# We'll move this to a real database before production.
 tokens = {}
 
 
@@ -25,7 +23,6 @@ def webhook():
     event = data.get("event")
     merchant = data.get("merchant")
 
-    # Never print access_token or refresh_token.
     print(f"Salla webhook received: event={event}, merchant={merchant}")
 
     if event == "app.store.authorize":
@@ -57,6 +54,7 @@ def status():
     return jsonify({
         "connected_merchants": list(tokens.keys())
     }), 200
+
 
 @app.route("/test-salla", methods=["GET"])
 def test_salla():
@@ -92,7 +90,7 @@ def test_salla():
             "store_name": store.get("name")
         }), 200
 
-      except Exception as e:
+    except Exception as e:
         print(f"Salla API error: {type(e).__name__}")
 
         if hasattr(e, "code"):
@@ -102,6 +100,7 @@ def test_salla():
             "success": False,
             "message": "Salla API request failed"
         }), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
