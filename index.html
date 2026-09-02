@@ -1,50 +1,165 @@
-
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI Agent</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-  <style>
-    * {
-      box-sizing: border-box;
-    }
+    <title>Fares AI Store Agent</title>
 
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-family: Arial, sans-serif;
-      background: #111;
-      color: #fff;
-    }
+    <script src="https://unpkg.com/@salla.sa/embedded-sdk/dist/umd/index.js"></script>
 
-    .container {
-      text-align: center;
-      padding: 40px;
-    }
+    <style>
+        * {
+            box-sizing: border-box;
+        }
 
-    h1 {
-      font-size: 48px;
-      margin-bottom: 15px;
-    }
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f8f8f8;
+            color: #222;
+        }
 
-    p {
-      font-size: 20px;
-      color: #aaa;
-    }
-  </style>
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 40px 24px;
+        }
+
+        .hero {
+            background: white;
+            border-radius: 16px;
+            padding: 40px;
+            border: 1px solid #e5e5e5;
+        }
+
+        h1 {
+            margin: 0 0 12px;
+            font-size: 30px;
+        }
+
+        p {
+            margin: 0;
+            color: #666;
+            font-size: 16px;
+        }
+
+        .status {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 25px;
+            padding: 10px 16px;
+            border-radius: 10px;
+            background: #e9fff7;
+            color: #008f63;
+            font-size: 14px;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #00b259;
+        }
+
+        .error {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 10px;
+            background: #fff0f0;
+            color: #d9363e;
+            display: none;
+        }
+    </style>
 </head>
 
 <body>
 
-  <div class="container">
-    <h1>AI Agent</h1>
-    <p>وكيل ذكاء اصطناعي للتكامل مع منصة سلة</p>
-  </div>
+<div class="container">
+
+    <div class="hero">
+
+        <h1>Fares AI Store Agent</h1>
+
+        <p>
+            وكيل ذكاء اصطناعي لتصميم وتجهيز متاجر سلة
+        </p>
+
+        <div class="status" id="status">
+            <span class="dot"></span>
+            تم الاتصال بسلة
+        </div>
+
+        <div class="error" id="error"></div>
+
+    </div>
+
+</div>
+
+
+<script>
+
+async function startApp() {
+
+    const status = document.getElementById("status");
+    const errorBox = document.getElementById("error");
+
+    try {
+
+        // التأكد من توفر Salla Embedded SDK
+        if (!window.Salla || !window.Salla.embedded) {
+            throw new Error("Salla Embedded SDK غير متوفر");
+        }
+
+        const embedded = window.Salla.embedded;
+
+        // تهيئة الاتصال مع لوحة تحكم سلة
+        await embedded.init({
+            debug: true
+        });
+
+        // قراءة Token الذي أرسلته سلة
+        const token = embedded.auth.getToken();
+
+        console.log("Salla embedded token:", token ? "received" : "missing");
+
+        if (!token) {
+            throw new Error("لم يتم استلام Token من سلة");
+        }
+
+        // تغيير عنوان الصفحة داخل لوحة سلة
+        if (embedded.page && embedded.page.setTitle) {
+            embedded.page.setTitle("Fares AI Store Agent");
+        }
+
+        // إخبار سلة أن التطبيق أصبح جاهزًا
+        embedded.ready();
+
+        console.log("Fares AI Store Agent is ready");
+
+        status.innerHTML = `
+            <span class="dot"></span>
+            الوكيل متصل وجاهز
+        `;
+
+    } catch (error) {
+
+        console.error("Salla Embedded SDK error:", error);
+
+        status.style.display = "none";
+
+        errorBox.style.display = "block";
+
+        errorBox.textContent =
+            "حدث خطأ في الاتصال مع سلة: " +
+            error.message;
+    }
+}
+
+startApp();
+
+</script>
 
 </body>
 </html>
