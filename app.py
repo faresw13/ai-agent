@@ -533,11 +533,11 @@ def attach_product_image(access_token, product_id, image_url, alt_text=""):
     parts = []
     for key, value in fields.items():
         parts.append(
-            f"--{boundary}\\r\\n"
-            f"Content-Disposition: form-data; name=\"{key}\"\\r\\n\\r\\n"
-            f"{value}\\r\\n"
+            f"--{boundary}\r\n"
+            f"Content-Disposition: form-data; name=\"{key}\"\r\n\r\n"
+            f"{value}\r\n"
         )
-    parts.append(f"--{boundary}--\\r\\n")
+    parts.append(f"--{boundary}--\r\n")
     body = "".join(parts).encode("utf-8")
 
     req = urllib.request.Request(
