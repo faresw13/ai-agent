@@ -58,6 +58,46 @@ def status():
         "connected_merchants": list(tokens.keys())
     }), 200
 
+@app.route("/test-salla", methods=["GET"])
+def test_salla():
+    import urllib.request
+    import json
+
+    if not tokens:
+        return jsonify({
+            "success": False,
+            "message": "No authorized Salla store"
+        }), 404
+
+    merchant = next(iter(tokens))
+    access_token = tokens[merchant]["access_token"]
+
+    req = urllib.request.Request(
+        "https://api.salla.dev/admin/v2/store/info",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json"
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        store = result.get("data", {})
+
+        return jsonify({
+            "success": True,
+            "store_id": store.get("id"),
+            "store_name": store.get("name")
+        }), 200
+
+    except Exception as e:
+        print(f"Salla API error: {type(e).__name__}")
+        return jsonify({
+            "success": False,
+            "message": "Salla API request failed"
+        }), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
