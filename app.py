@@ -758,8 +758,22 @@ def _is_blocked_source(url):
     return any(part in lowered for part in blocked_parts)
 
 
+def _looks_like_image_url(image_url):
+    """Fast heuristic for image URLs; Salla performs the final fetch/validation."""
+    if not image_url or not image_url.startswith(("http://", "https://")):
+        return False
+
+    lowered = image_url.lower().split("?", 1)[0]
+    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".svg")
+    if lowered.endswith(image_exts):
+        return True
+
+    image_markers = ("/image/", "/images/", "/img/", "/media/", "/assets/", "/product-images/", "/productimage")
+    return any(marker in lowered for marker in image_markers)
+
+
 def _validate_image_url(image_url):
-    """Confirm the URL actually serves an image, without downloading the whole file."""
+    """Best-effort validation. Never reject a plausible CDN image only because HEAD is blocked."""
     if not image_url or not image_url.startswith(("http://", "https://")):
         return False
 
@@ -772,61 +786,87 @@ def _validate_image_url(image_url):
             },
             method="HEAD"
         )
-        with urllib.request.urlopen(req, timeout=12) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             content_type = (response.headers.get("Content-Type") or "").lower()
             if content_type.startswith("image/"):
                 return True
     except Exception:
         pass
 
-    # Some CDNs reject HEAD; fetch only a small prefix instead.
     try:
         req = urllib.request.Request(
             image_url,
             headers={
                 "User-Agent": "Mozilla/5.0 (compatible; FaresAIAgent/1.0)",
-                "Range": "bytes=0-2048"
+                "Range": "bytes=0-2048",
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
             },
             method="GET"
         )
-        with urllib.request.urlopen(req, timeout=12) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             content_type = (response.headers.get("Content-Type") or "").lower()
             response.read(2048)
-            return content_type.startswith("image/")
+            if content_type.startswith("image/"):
+                return True
     except Exception:
-        return False
+        pass
+
+    # Some legitimate CDN URLs block our HEAD/GET requests. If the URL itself
+    # clearly looks like an image URL, let Salla be the final validator.
+    return _looks_like_image_url(image_url)
+
+
+def _image_search_queries(product_name):
+    """Return several searches so one blocked manufacturer page cannot stop the agent."""
+    name = product_name.strip()
+    queries = [
+        f'"{name}" direct image jpg png product photo',
+        f'"{name}" product page image',
+    ]
+
+    lowered = name.lower()
+    if any(k in lowered for k in ("iphone", "apple", "ipad", "macbook", "airpods")):
+        queries.extend([
+            f'"{name}" site:luluhypermarket.com image',
+            f'"{name}" site:saco.sa image',
+            f'"{name}" site:carrefourksa.com image',
+        ])
+    elif any(k in lowered for k in ("galaxy", "samsung")):
+        queries.extend([
+            f'"{name}" site:samsung.com image',
+            f'"{name}" site:luluhypermarket.com image',
+            f'"{name}" site:carrefourksa.com image',
+        ])
+    elif any(k in lowered for k in ("playstation", "ps5")):
+        queries.extend([
+            f'"{name}" site:playstation.com image',
+            f'"{name}" site:luluhypermarket.com image',
+            f'"{name}" site:carrefourksa.com image',
+        ])
+
+    return queries
 
 
 def search_product_image_with_openai(product_name):
-    """Search broadly for a real product page and return a validated image URL.
-
-    Important: do NOT restrict the web search to the manufacturer's domain.
-    Some manufacturer pages (for example, Apple) block server-side fetching,
-    while retailer/review/product pages may expose a usable og:image or JSON-LD image.
-    """
+    """Find a real product image URL using web search, then let Salla validate it."""
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not configured")
 
-    queries = [
-        f'"{product_name}" official product image',
-        f'"{product_name}" product photo image review',
-    ]
-
     all_source_urls = []
+    all_candidates = []
 
-    for query in queries:
+    for query in _image_search_queries(product_name):
         prompt = f"""
-ابحث في الإنترنت عن صفحة حقيقية وموثوقة للمنتج التالي:
+ابحث في الإنترنت عن المنتج التالي:
 {product_name}
 
-الهدف هو العثور على صفحة يمكن الوصول إليها من الخادم وتحتوي على صورة واضحة للمنتج.
-فضّل صفحة الشركة المصنعة، لكن إذا كانت محجوبة أو لا يمكن الوصول إلى صورتها، اختر
-مصدرًا موثوقًا آخر مثل متجر معروف أو موقع مراجعات تقني معروف.
+أريد صورة حقيقية للمنتج من الإنترنت، وليست صورة مولدة بالذكاء الاصطناعي.
+نفّذ البحث عن المنتج ثم استخرج إن أمكن رابط الصورة المباشر نفسه (JPG أو PNG أو WEBP)، وليس رابط صفحة المنتج.
+إذا لم يظهر رابط الصورة المباشر، اذكر أفضل صفحة منتج موثوقة تحتوي على صورة المنتج حتى يستطيع الخادم استخراج og:image منها.
 
-لا تستخدم أي صفحة من متجر سلة الخاص بي.
+لا تستخدم أي رابط من متجر سلة الخاص بي.
 لا تخترع أي رابط.
-
-في نهاية الرد اذكر أفضل صفحة ظهرت في نتائج البحث.
+لا تعطِ رابطًا لصفحة سلة.
 """
 
         payload = {
@@ -846,45 +886,60 @@ def search_product_image_with_openai(product_name):
             print("IMAGE SEARCH ERROR:", exc)
             continue
 
-        for url in _extract_web_search_source_urls(result):
+        urls = _extract_web_search_source_urls(result)
+        for url in urls:
             if url not in all_source_urls and not _is_blocked_source(url):
                 all_source_urls.append(url)
 
-        # Try every URL exposed by the Responses API, including URL citations.
-        for page_url in all_source_urls[-20:]:
+        # First try URLs exposed directly by the search response.
+        for candidate in urls:
+            if _is_blocked_source(candidate):
+                continue
+            if _looks_like_image_url(candidate):
+                all_candidates.append((candidate, candidate))
+
+        # Then open each search result and extract og:image / JSON-LD.
+        for page_url in urls[:15]:
             if _is_blocked_source(page_url):
                 continue
+            image_url = _extract_page_image_url(page_url)
+            if image_url and not _is_blocked_source(image_url):
+                all_candidates.append((image_url, page_url))
 
-            # Sometimes a search source itself is a direct image URL.
-            if _validate_image_url(page_url):
+        # The model may put a direct image URL in output_text even when the
+        # Responses API does not expose it as a source object.
+        text = result.get("output_text") or ""
+        for candidate in re.findall(r'https?://[^\s<>"\']+', text):
+            candidate = candidate.rstrip(".,;:)]}")
+            if _is_blocked_source(candidate):
+                continue
+            if _looks_like_image_url(candidate):
+                all_candidates.append((candidate, candidate))
+
+        # De-duplicate while preserving search order.
+        seen = set()
+        for image_url, source_page in all_candidates:
+            if image_url in seen:
+                continue
+            seen.add(image_url)
+
+            # Strong validation when possible; otherwise accept a plausible
+            # image URL and let Salla perform the definitive fetch.
+            if _validate_image_url(image_url) or _looks_like_image_url(image_url):
                 return {
                     "success": True,
-                    "image_url": page_url,
+                    "image_url": image_url,
                     "alt": product_name,
-                    "source_page": page_url
+                    "source_page": source_page,
+                    "message": "تم العثور على رابط صورة حقيقي محتمل، وسيتم التحقق منه عند إرفاقه في سلة."
                 }
-
-            image_url = _extract_page_image_url(page_url)
-            if not image_url:
-                continue
-            if _is_blocked_source(image_url):
-                continue
-            if not _validate_image_url(image_url):
-                continue
-
-            return {
-                "success": True,
-                "image_url": image_url,
-                "alt": product_name,
-                "source_page": page_url
-            }
 
     return {
         "success": False,
         "image_url": None,
         "alt": product_name,
         "sources_checked": all_source_urls[:20],
-        "message": "لم أجد رابط صورة عام موثوق يمكن التحقق منه. لا تستخدم أي رابط بديل أو مخمن."
+        "message": "لم أجد رابط صورة مناسبًا يمكن استخدامه. لا تستخدم أي رابط مخمن."
     }
 
 def create_product(access_token, arguments):
@@ -914,12 +969,28 @@ def create_product(access_token, arguments):
         if not product_id:
             raise RuntimeError("Salla created the product but did not return its ID")
 
-        image_result = attach_product_image(
-            access_token,
-            product_id,
-            image_url,
-            image_alt
-        )
+        try:
+            image_result = attach_product_image(
+                access_token,
+                product_id,
+                image_url,
+                image_alt
+            )
+        except urllib.error.HTTPError as first_error:
+            # A CDN may reject server-side fetching even though the image is
+            # valid in a browser. Search once more for another public image.
+            print(f"First image attach failed: HTTP {first_error.code}")
+            retry = search_product_image_with_openai(arguments.get("name", ""))
+            retry_url = retry.get("image_url") if retry.get("success") else None
+            if not retry_url or retry_url == image_url:
+                raise
+            image_result = attach_product_image(
+                access_token,
+                product_id,
+                retry_url,
+                image_alt
+            )
+            image_result["retry_source_page"] = retry.get("source_page")
 
         return {
             "product": created,
@@ -1206,6 +1277,14 @@ def get_agent_tools():
                     "channels": {
                         "type": ["array", "null"],
                         "items": {"type": "string"}
+                    },
+                    "image_url": {
+                        "type": ["string", "null"],
+                        "description": "رابط صورة مباشر حقيقي أعادته أداة find_product_image"
+                    },
+                    "image_alt": {
+                        "type": ["string", "null"],
+                        "description": "النص البديل للصورة"
                     }
                 },
                 "required": [
@@ -1542,10 +1621,10 @@ def agent_chat():
 10. إذا كان الطلب غامضًا أو يحتاج معلومة أساسية غير موجودة، اسأل
     المستخدم بدل التخمين.
 11. إذا طلب المستخدم صورة من الإنترنت، يجب أولًا استدعاء أداة find_product_image والانتظار لنتيجتها.
-12. لا تستخدم أبدًا رابط صفحة ويب كرابط صورة، ولا تخمّن أي رابط صورة. يجب أن يكون image_url رابط صورة مباشرًا وناجح التحقق.
-13. إذا فشلت find_product_image، لا تنشئ المنتج على أنه مكتمل بصورة؛ أخبر المستخدم أن العثور على صورة موثوقة فشل.
-14. إذا نجحت find_product_image، مرّر image_url الذي أعادته الأداة إلى create_product.
-15. بعد إنشاء المنتج مع الصورة، استخدم get_products للتحقق من وجود المنتج والوصف والصورة.
+12. لا تستخدم رابط صفحة ويب كرابط صورة ولا تخمّن أي رابط. استخدم image_url الذي أعادته الأداة فقط.
+13. إذا فشلت find_product_image، لا تدّعي أن الصورة أضيفت.
+14. إذا نجحت find_product_image، مرّر image_url وimage_alt إلى create_product. أداة create_product هي التي تحاول إرفاق الصورة فعليًا في سلة، وقد تعيد المحاولة بصورة بديلة إذا رفض المصدر الأول.
+15. بعد إنشاء المنتج، استخدم get_products للتحقق من وجود المنتج والصورة.
 16. تحدث بالعربية السعودية وبأسلوب واضح ومباشر.
 17. يمكنك تنفيذ عدة عمليات متتالية إذا كان طلب المستخدم واضحًا.
 18. قبل إنشاء قسم جديد، اقرأ الأقسام الحالية لتجنب التكرار.
